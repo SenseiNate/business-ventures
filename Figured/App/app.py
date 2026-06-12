@@ -304,6 +304,7 @@ defaults = {
     "show_confetti": False,
     "last_input": "",
     "lesson_preview": None,
+    "message_count": 0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -552,8 +553,45 @@ elif st.session_state.screen == "chat":
     user_text = user_input.strip() if user_input else ""
     should_respond = send and user_text
 
-    if should_respond:
+    # ── Session limit wall ────────────────────────────────────────────────────
+    MESSAGE_LIMIT = 10
+
+    if st.session_state.message_count >= MESSAGE_LIMIT:
+        st.markdown("""
+        <div style="
+            background: #f5f3ff;
+            border: 2px solid #e0e7ff;
+            border-radius: 1.25rem;
+            padding: 2rem;
+            text-align: center;
+            max-width: 520px;
+            margin: 1rem auto;
+        ">
+            <div style="font-size:2rem;margin-bottom:0.75rem;">🧠</div>
+            <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:1.2rem;color:#1a1a2e;margin-bottom:0.5rem;">
+                You've hit your free session limit.
+            </div>
+            <div style="font-size:0.93rem;color:#6b7280;line-height:1.6;margin-bottom:1.25rem;">
+                Figured is in early access. You used 10 messages — that means you were actually thinking, which is the whole point.<br><br>
+                Want unlimited access? Drop your email and you'll be first to know when full access opens.
+            </div>
+            <a href="https://forms.gle/YOURFORMLINK" target="_blank" style="
+                background: #6366f1;
+                color: white;
+                border-radius: 2rem;
+                padding: 0.75rem 2rem;
+                font-family: 'DM Sans', sans-serif;
+                font-weight: 500;
+                font-size: 1rem;
+                text-decoration: none;
+                display: inline-block;
+            ">Join the waitlist</a>
+        </div>
+        """, unsafe_allow_html=True)
+
+    elif should_respond:
         st.session_state.last_input = user_text
+        st.session_state.message_count += 1
         breakthrough = is_breakthrough(user_text)
         progress = is_progress(user_text) and not breakthrough
 
