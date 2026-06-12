@@ -575,7 +575,7 @@ elif st.session_state.screen == "chat":
                 Figured is in early access. You used 10 messages — that means you were actually thinking, which is the whole point.<br><br>
                 Want unlimited access? Drop your email and you'll be first to know when full access opens.
             </div>
-            <a href="https://forms.gle/YOURFORMLINK" target="_blank" style="
+            <a href="https://forms.gle/5d5EZJCUCkwnGauT6" target="_blank" style="
                 background: #6366f1;
                 color: white;
                 border-radius: 2rem;
