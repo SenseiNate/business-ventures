@@ -100,14 +100,15 @@ def load_system_prompt() -> str:
     return """You are Figured — a patient, encouraging Socratic guide for all learners. Never give direct answers. Guide learners to discover answers themselves through questions and hints. Adapt to the learner's level. In Fact Mode (lookup questions like dates, formulas, definitions), answer directly then ask a follow-up question. In Explore Mode (reasoning, problem solving), never give the answer. Never say 'certainly', 'great question', or 'as an AI'."""
 
 
-def build_session_prompt(base: str, level: str, subject: str) -> str:
+def build_session_prompt(base: str, level: str, sublevel: str, subject: str) -> str:
     level_context = {
-        "K-12": "The learner is a K-12 student. Use age-appropriate language, simple analogies, and lots of encouragement.",
-        "College": "The learner is a college student. Match their degree-level depth. Challenge their reasoning and push for deeper understanding.",
+        "K-12": f"The learner is a {sublevel} student. Use age-appropriate language, simple analogies, and lots of encouragement. Pitch complexity exactly right for {sublevel}.",
+        "College": f"The learner is at {sublevel} level. Match the academic depth expected at {sublevel}. Challenge their reasoning appropriately.",
         "Professional": "The learner is a working professional. Connect concepts to real-world applications and career relevance.",
     }
     context = level_context.get(level, "")
-    return f"{base}\n\n## Session Context\nLevel: {level}\nSubject: {subject}\n{context}\n\nStart by orienting the learner to what you'll work on together, then begin guiding them through the subject using the Socratic method."
+    sublevel_str = f" ({sublevel})" if sublevel else ""
+    return f"{base}\n\n## Session Context\nLevel: {level}{sublevel_str}\nSubject: {subject}\n{context}\n\nStart by orienting the learner to what you'll work on together, then begin guiding them through the subject using the Socratic method."
 
 
 def is_breakthrough(text: str) -> bool:
@@ -294,6 +295,19 @@ section[data-testid="stMain"] > div { padding-top: 0 !important; }
 """, unsafe_allow_html=True)
 
 
+SUBLEVELS = {
+    "K-12": [
+        "Kindergarten", "Grade 1", "Grade 2", "Grade 3", "Grade 4",
+        "Grade 5", "Grade 6", "Grade 7", "Grade 8",
+        "Grade 9 (Freshman)", "Grade 10 (Sophomore)",
+        "Grade 11 (Junior)", "Grade 12 (Senior)"
+    ],
+    "College": [
+        "Associate's", "Bachelor's", "Master's", "PhD", "Doctorate / Professional Degree"
+    ],
+}
+
+
 def wordmark_html(size="2.2rem", **kwargs):
     return f"""<span class="figured-wordmark-wrap" style="font-size:{size};">F<span class="figured-i-wrap">I</span>GURED</span>"""
 
@@ -301,6 +315,7 @@ def wordmark_html(size="2.2rem", **kwargs):
 defaults = {
     "screen": "level",
     "level": None,
+    "sublevel": None,
     "subject": None,
     "custom_subject": "",
     "messages": [],
@@ -311,6 +326,7 @@ defaults = {
     "last_input": "",
     "lesson_preview": None,
     "message_count": 0,
+    "is_thinking": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -325,6 +341,26 @@ if "client" not in st.session_state:
         st.error("ANTHROPIC_API_KEY not found. Add it to your .env file.")
         st.stop()
     st.session_state.client = anthropic.Anthropic(api_key=api_key)
+
+# ── Cookie-based session persistence ─────────────────────────────────────────
+# Uses st.query_params as a lightweight fingerprint to persist message count
+# across refreshes. Not bulletproof but stops casual abuse.
+import hashlib, time as _time
+
+if "session_id" not in st.session_state:
+    # Generate a session ID tied to this browser tab
+    raw = str(_time.time()) + str(random.random())
+    st.session_state.session_id = hashlib.md5(raw.encode()).hexdigest()[:12]
+
+# Store message count in query params so refresh doesn't reset it
+_params = st.query_params
+if "mc" in _params:
+    try:
+        stored = int(_params["mc"])
+        if st.session_state.message_count == 0 and stored > 0:
+            st.session_state.message_count = stored
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -360,6 +396,55 @@ if st.session_state.screen == "level":
             """, unsafe_allow_html=True)
             if st.button(f"Select {key}", key=f"lvl_{key}", use_container_width=True):
                 st.session_state.level = key
+                st.session_state.sublevel = None
+                if key == "Professional":
+                    st.session_state.screen = "subject"
+                else:
+                    st.session_state.screen = "sublevel"
+                st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCREEN 1.5 — Sublevel selection (K-12 grades / College degree)
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif st.session_state.screen == "sublevel":
+    level = st.session_state.level
+    sublevels = SUBLEVELS[level]
+    emoji = LEVELS[level]["emoji"]
+
+    label = "What grade are you in?" if level == "K-12" else "What degree level are you at?"
+    sub = "Pick your grade so Figured can match the right depth." if level == "K-12" else "Figured adjusts the depth and complexity to your degree level."
+
+    st.markdown(f"""
+    <div class="onboard-wrap">
+        <div style="text-align:center;margin-bottom:2rem;">{wordmark_html("2rem")}</div>
+        <div class="onboard-step">Step 1.5 of 3</div>
+        <div class="onboard-q">{label}</div>
+        <div class="onboard-sub">{sub}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    cols = st.columns(4) if level == "K-12" else st.columns(3)
+    for i, sl in enumerate(sublevels):
+        col_count = 4 if level == "K-12" else 3
+        with cols[i % col_count]:
+            selected = st.session_state.sublevel == sl
+            label_btn = f"✓ {sl}" if selected else sl
+            if st.button(label_btn, key=f"sl_{sl}", use_container_width=True):
+                st.session_state.sublevel = sl
+                st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_back, col_spacer, col_next = st.columns([1, 2, 1])
+    with col_back:
+        if st.button("Back", key="back_sublevel"):
+            st.session_state.screen = "level"
+            st.session_state.sublevel = None
+            st.rerun()
+    with col_next:
+        if st.session_state.sublevel:
+            if st.button("Next", key="next_from_sublevel"):
                 st.session_state.screen = "subject"
                 st.rerun()
 
@@ -467,7 +552,8 @@ elif st.session_state.screen == "preview":
     with col_start:
         if st.button("Let's go", key="start_session"):
             base = st.session_state.system_prompt
-            st.session_state.system_prompt = build_session_prompt(base, level, subject)
+            sublevel = st.session_state.sublevel or ""
+            st.session_state.system_prompt = build_session_prompt(base, level, sublevel, subject)
             st.session_state.screen = "chat"
             st.rerun()
 
@@ -508,7 +594,7 @@ elif st.session_state.screen == "chat":
     <div class="figured-header">
         {wordmark_html("2.6rem")}
         <div class="figured-tagline">{st.session_state.tagline}</div>
-        <div class="session-badge">{emoji} {level} &nbsp;|&nbsp; {subject}</div>
+        <div class="session-badge">{emoji} {level}{f' | {st.session_state.sublevel}' if st.session_state.sublevel else ''} &nbsp;|&nbsp; {subject}</div>
     </div>
     <hr class="chat-divider">
     """, unsafe_allow_html=True)
@@ -557,7 +643,7 @@ elif st.session_state.screen == "chat":
     st.markdown('</div>', unsafe_allow_html=True)
 
     user_text = user_input.strip() if user_input else ""
-    should_respond = send and user_text
+    should_respond = send and user_text and not st.session_state.is_thinking
 
     # ── Session limit wall ────────────────────────────────────────────────────
     MESSAGE_LIMIT = 10
@@ -598,6 +684,9 @@ elif st.session_state.screen == "chat":
     elif should_respond:
         st.session_state.last_input = user_text
         st.session_state.message_count += 1
+        st.session_state.is_thinking = True
+        # Persist message count to query params so refresh doesn't reset
+        st.query_params["mc"] = str(st.session_state.message_count)
         breakthrough = is_breakthrough(user_text)
         progress = is_progress(user_text) and not breakthrough
 
@@ -634,6 +723,7 @@ elif st.session_state.screen == "chat":
 
         typing_slot.empty()
         user_slot.empty()
+        st.session_state.is_thinking = False
         st.session_state.messages.append({"role": "assistant", "content": reply})
 
         if breakthrough:
