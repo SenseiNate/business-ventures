@@ -85,13 +85,19 @@ LEVELS = {
 
 
 def load_system_prompt() -> str:
-    if SYSTEM_PROMPT_PATH.exists():
-        return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-    return (
-        "You are Figured, a patient Socratic guide for all learners. "
-        "Never give direct answers. Guide learners to discover answers themselves "
-        "through questions and hints. Adapt to the learner's level."
-    )
+    # Try multiple paths to support both local and Streamlit Cloud
+    possible_paths = [
+        Path(__file__).parent.parent / "tutor" / "system_prompt.md",
+        Path(__file__).parent / "system_prompt.md",
+        Path("figured/tutor/system_prompt.md"),
+        Path("tutor/system_prompt.md"),
+        Path("system_prompt.md"),
+    ]
+    for path in possible_paths:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    # Fallback — core rules inline so app never breaks on deploy
+    return """You are Figured — a patient, encouraging Socratic guide for all learners. Never give direct answers. Guide learners to discover answers themselves through questions and hints. Adapt to the learner's level. In Fact Mode (lookup questions like dates, formulas, definitions), answer directly then ask a follow-up question. In Explore Mode (reasoning, problem solving), never give the answer. Never say 'certainly', 'great question', or 'as an AI'."""
 
 
 def build_session_prompt(base: str, level: str, subject: str) -> str:
@@ -575,7 +581,7 @@ elif st.session_state.screen == "chat":
                 Figured is in early access. You used 10 messages — that means you were actually thinking, which is the whole point.<br><br>
                 Want unlimited access? Drop your email and you'll be first to know when full access opens.
             </div>
-            <a href="https://forms.gle/5d5EZJCUCkwnGauT6" target="_blank" style="
+            <a href="https://forms.gle/YOURFORMLINK" target="_blank" style="
                 background: #6366f1;
                 color: white;
                 border-radius: 2rem;
