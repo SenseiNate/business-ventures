@@ -50,14 +50,15 @@ def slugify(text: str) -> str:
 
 def gather_web_candidates(client: anthropic.Anthropic, goal: str) -> list[dict[str, str]]:
     prompt = (
-        "Research the following goal using web search:\n\n"
+        "Use web search to find content relevant to this research topic:\n\n"
         f'"{goal}"\n\n'
-        "Search the web broadly — articles, forums, social media discussions, "
-        "product pages, anything relevant. "
-        "After searching, respond with ONLY a JSON array of the most relevant "
-        "pages you found. Each item must have these exact keys: "
+        "Search broadly: articles, forums, social media discussions, product pages, "
+        "anything relevant. Don't worry about ranking, scoring, or filtering yet, "
+        "just gather candidates.\n\n"
+        "After searching, respond with ONLY a JSON array, no other text before or "
+        "after it. Each item must have these exact keys: "
         '"title", "url", "snippet" (1-3 sentences summarizing what the page says). '
-        "Include up to 20 items. Respond with ONLY the JSON array, no other text."
+        "Include up to 20 items."
     )
 
     message = client.messages.create(
@@ -92,7 +93,17 @@ def gather_web_candidates(client: anthropic.Anthropic, goal: str) -> list[dict[s
     try:
         items = json.loads(raw)
     except json.JSONDecodeError:
-        return []
+        # Try to salvage a JSON array embedded in extra prose before giving up
+        match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+        if match:
+            try:
+                items = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                print(f"  [debug] Could not parse search results as JSON. Raw response:\n{raw[:500]}")
+                return []
+        else:
+            print(f"  [debug] Could not parse search results as JSON. Raw response:\n{raw[:500]}")
+            return []
 
     candidates = []
     if isinstance(items, list):
