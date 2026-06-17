@@ -1,0 +1,25 @@
+GitHub commands for Push-Commit
+
+For portfolio updates (any time I hand you a new index.html, or you edit it yourself):
+cd "C:\Users\natha\OneDrive\Desktop\Business Ventures\SenseiNate.github.io"
+git add .
+git commit -m "describe what you changed"
+git push
+
+This always goes to SenseiNate/SenseiNate.github.io, your live site. This is unchanged from what you've been doing.
+
+
+For business venture project updates (Figured code, Web Scraper Agent, the log doc):
+
+cd "C:\Users\natha\OneDrive\Desktop\Business Ventures\Web Scraper Agent"
+git pull
+git add .
+git commit -m "describe what you changed"
+git push
+
+
+cd "C:\Users\natha\OneDrive\Desktop\Business Ventures\Figured"
+git pull
+git add .
+git commit -m "describe what you changed"
+git push
