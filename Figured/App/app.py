@@ -83,6 +83,44 @@ LEVELS = {
     },
 }
 
+PERSONALITIES = {
+    "The Coach": {
+        "emoji": "🏆",
+        "desc": "Direct, no fluff, outcome-focused",
+        "prompt": "Your personality for this session is The Coach. Be direct, cut to the real problem fast, use short sentences, and push for results not comfort. No motivational-poster language.",
+    },
+    "The Professor": {
+        "emoji": "🎓",
+        "desc": "Measured, precise, intellectually rigorous",
+        "prompt": "Your personality for this session is The Professor. Be measured and precise. Name concepts, draw distinctions, and don't let vague language slide. Love nuance.",
+    },
+    "The Sparring Partner": {
+        "emoji": "🥊",
+        "desc": "Challenges you, plays devil's advocate",
+        "prompt": "Your personality for this session is The Sparring Partner. Push back on weak reasoning immediately. Play devil's advocate. Make the learner build arguments that can take a punch.",
+    },
+    "The Mentor": {
+        "emoji": "🌟",
+        "desc": "Warm, experience-rooted, in your corner",
+        "prompt": "Your personality for this session is The Mentor. Be warm and experience-rooted. Connect concepts to real situations. Make the learner feel like someone is genuinely in their corner.",
+    },
+    "The Drill Instructor": {
+        "emoji": "🪖",
+        "desc": "Blunt, high standards, zero excuses",
+        "prompt": "Your personality for this session is The Drill Instructor. Be blunt and relentless with high standards. Call out weak thinking immediately and expect better. Not mean, but uncompromising.",
+    },
+    "The Study Buddy": {
+        "emoji": "📚",
+        "desc": "Casual, peer-level, low pressure",
+        "prompt": "Your personality for this session is The Study Buddy. Be casual and peer-level. Think out loud alongside the learner. Make confusion feel normal and collaborative.",
+    },
+    "The Hype Friend": {
+        "emoji": "🎉",
+        "desc": "Bubbly, enthusiastic, genuinely excited for you",
+        "prompt": "Your personality for this session is The Hype Friend. Be bubbly and genuinely excited for every step forward. Celebrate progress specifically, not generically. Bring real energy.",
+    },
+}
+
 
 def load_system_prompt() -> str:
     # Try multiple paths to support both local and Streamlit Cloud
@@ -100,7 +138,7 @@ def load_system_prompt() -> str:
     return """You are Figured — a patient, encouraging Socratic guide for all learners. Never give direct answers. Guide learners to discover answers themselves through questions and hints. Adapt to the learner's level. In Fact Mode (lookup questions like dates, formulas, definitions), answer directly then ask a follow-up question. In Explore Mode (reasoning, problem solving), never give the answer. Never say 'certainly', 'great question', or 'as an AI'. In Explore Mode, end every response with a hidden rating of how close the learner is to the answer on a 1-10 scale, formatted as [WARMTH:n] on its own line with nothing after it, never mentioned in the visible text. Omit this in Fact Mode."""
 
 
-def build_session_prompt(base: str, level: str, sublevel: str, subject: str) -> str:
+def build_session_prompt(base: str, level: str, sublevel: str, subject: str, personality: str = "The Mentor") -> str:
     level_context = {
         "K-12": f"The learner is a {sublevel} student. Use age-appropriate language, simple analogies, and lots of encouragement. Pitch complexity exactly right for {sublevel}.",
         "College": f"The learner is at {sublevel} level. Match the academic depth expected at {sublevel}. Challenge their reasoning appropriately.",
@@ -108,7 +146,8 @@ def build_session_prompt(base: str, level: str, sublevel: str, subject: str) -> 
     }
     context = level_context.get(level, "")
     sublevel_str = f" ({sublevel})" if sublevel else ""
-    return f"{base}\n\n## Session Context\nLevel: {level}{sublevel_str}\nSubject: {subject}\n{context}\n\nStart by orienting the learner to what you'll work on together, then begin guiding them through the subject using the Socratic method."
+    personality_prompt = PERSONALITIES.get(personality, PERSONALITIES["The Mentor"])["prompt"]
+    return f"{base}\n\n## Session Context\nLevel: {level}{sublevel_str}\nSubject: {subject}\n{context}\n\n## Active Personality\n{personality_prompt}\n\nStart by orienting the learner to what you'll work on together in the voice of your active personality, then begin guiding them through the subject using the Socratic method."
 
 
 def is_breakthrough(text: str) -> bool:
@@ -355,6 +394,7 @@ defaults = {
     "sublevel": None,
     "subject": None,
     "custom_subject": "",
+    "personality": None,
     "messages": [],
     "greeted": False,
     "tagline": random.choice(TAGLINES),
@@ -589,16 +629,70 @@ elif st.session_state.screen == "preview":
             st.rerun()
     with col_start:
         if st.button("Let's go", key="start_session"):
-            base = st.session_state.system_prompt
-            sublevel = st.session_state.sublevel or ""
-            st.session_state.system_prompt = build_session_prompt(base, level, sublevel, subject)
-            st.session_state.screen = "chat"
+            st.session_state.screen = "personality"
             st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCREEN 4 — Chat
+# SCREEN 4 — Personality Selector
 # ══════════════════════════════════════════════════════════════════════════════
+
+elif st.session_state.screen == "personality":
+    level = st.session_state.level
+    subject = st.session_state.subject
+
+    st.markdown(f"""
+    <div class="figured-header">
+        {wordmark_html()}
+        <div class="figured-tagline">how do you want to be taught?</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    cols = st.columns(2)
+    personality_list = list(PERSONALITIES.keys())
+    for i, name in enumerate(personality_list):
+        p = PERSONALITIES[name]
+        col = cols[i % 2]
+        selected = st.session_state.personality == name
+        with col:
+            bg = "#6366f1" if selected else "#ffffff"
+            text_color = "white" if selected else "#1a1a2e"
+            border = "#6366f1" if selected else "#e5e7eb"
+            desc_color = "rgba(255,255,255,0.8)" if selected else "#6b7280"
+            st.markdown(f"""
+            <div style="background:{bg};border:2px solid {border};border-radius:1.25rem;
+                padding:1rem 1.1rem;margin-bottom:0.75rem;cursor:pointer;transition:all 0.15s;">
+                <div style="font-size:1.4rem;margin-bottom:0.25rem;">{p['emoji']}</div>
+                <div style="font-weight:700;font-size:0.95rem;color:{text_color};">{name}</div>
+                <div style="font-size:0.8rem;color:{desc_color};margin-top:0.2rem;">{p['desc']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("Select", key=f"p_{name}", use_container_width=True):
+                st.session_state.personality = name
+                st.rerun()
+
+    if st.session_state.personality:
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_back, col_spacer, col_start = st.columns([1, 2, 1])
+        with col_back:
+            if st.button("Back", key="back_personality"):
+                st.session_state.screen = "preview"
+                st.rerun()
+        with col_start:
+            if st.button("Start session", key="launch_chat"):
+                base = st.session_state.system_prompt
+                sublevel = st.session_state.sublevel or ""
+                personality = st.session_state.personality or "The Mentor"
+                st.session_state.system_prompt = build_session_prompt(base, level, sublevel, subject, personality)
+                st.session_state.screen = "chat"
+                st.rerun()
+    else:
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_back, _ = st.columns([1, 3])
+        with col_back:
+            if st.button("Back", key="back_personality_no_sel"):
+                st.session_state.screen = "preview"
+                st.rerun()
 
 elif st.session_state.screen == "chat":
     level = st.session_state.level
