@@ -97,7 +97,7 @@ def load_system_prompt() -> str:
         if path.exists():
             return path.read_text(encoding="utf-8")
     # Fallback — core rules inline so app never breaks on deploy
-    return """You are Figured — a patient, encouraging Socratic guide for all learners. Never give direct answers. Guide learners to discover answers themselves through questions and hints. Adapt to the learner's level. In Fact Mode (lookup questions like dates, formulas, definitions), answer directly then ask a follow-up question. In Explore Mode (reasoning, problem solving), never give the answer. Never say 'certainly', 'great question', or 'as an AI'."""
+    return """You are Figured — a patient, encouraging Socratic guide for all learners. Never give direct answers. Guide learners to discover answers themselves through questions and hints. Adapt to the learner's level. In Fact Mode (lookup questions like dates, formulas, definitions), answer directly then ask a follow-up question. In Explore Mode (reasoning, problem solving), never give the answer. Never say 'certainly', 'great question', or 'as an AI'. In Explore Mode, end every response with a hidden rating of how close the learner is to the answer on a 1-10 scale, formatted as [WARMTH:n] on its own line with nothing after it, never mentioned in the visible text. Omit this in Fact Mode."""
 
 
 def build_session_prompt(base: str, level: str, sublevel: str, subject: str) -> str:
@@ -120,6 +120,38 @@ def is_progress(text: str) -> bool:
     progress_words = ["maybe", "i think", "could it be", "is it", "so if", "because", "since", "would"]
     t = text.lower()
     return any(w in t for w in progress_words)
+
+
+def extract_warmth(reply: str):
+    """Strip the hidden [WARMTH:n] tag from a reply, returning (clean_text, warmth_int_or_None)."""
+    import re
+    match = re.search(r"\[WARMTH:(\d{1,2})\]\s*$", reply.strip())
+    if not match:
+        return reply, None
+    n = max(1, min(10, int(match.group(1))))
+    clean = reply[:match.start()].rstrip()
+    return clean, n
+
+
+def render_warmth_indicator(n: int):
+    """Render a small gradient bar reflecting how close the learner is, without exposing the raw number."""
+    pct = int(n / 10 * 100)
+    if n <= 3:
+        color, label = "#93a4c3", "cold"
+    elif n <= 6:
+        color, label = "#f6ad55", "warm"
+    elif n <= 9:
+        color, label = "#fb7185", "hot"
+    else:
+        color, label = "#6366f1", "got it"
+    st.markdown(f"""
+    <div class="warmth-wrap">
+        <span class="warmth-label">{label}</span>
+        <div class="warmth-track">
+            <div class="warmth-fill" style="width:{pct}%; background:{color};"></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 st.set_page_config(
@@ -252,6 +284,11 @@ section[data-testid="stMain"] > div { padding-top: 0 !important; }
 .confetti-wrapper { text-align: center; font-size: 1.6rem; letter-spacing: 0.1em; margin-bottom: 0.5rem; animation: pop 0.5s ease; }
 @keyframes pop { 0% { transform: scale(0.5); opacity: 0; } 70% { transform: scale(1.15); opacity: 1; } 100% { transform: scale(1); } }
 
+.warmth-wrap { display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.85rem 2.5rem; }
+.warmth-label { font-size: 0.7rem; font-weight: 600; color: #9ca3af; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+.warmth-track { flex: 1; max-width: 140px; height: 6px; border-radius: 1rem; background: #f0f0f5; overflow: hidden; }
+.warmth-fill { height: 100%; border-radius: 1rem; transition: width 0.5s ease, background 0.5s ease; }
+
 /* Chat input */
 .stTextInput > div > div > input {
     border-radius: 2rem !important; border: 2px solid #e5e7eb !important;
@@ -327,6 +364,7 @@ defaults = {
     "lesson_preview": None,
     "message_count": 0,
     "is_thinking": False,
+    "current_warmth": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -603,7 +641,7 @@ elif st.session_state.screen == "chat":
         st.markdown('<div class="confetti-wrapper">🎉 ✨ 🔥 💡 🎯 ✨ 🎉</div>', unsafe_allow_html=True)
         st.session_state.show_confetti = False
 
-    for msg in st.session_state.messages:
+    for idx, msg in enumerate(st.session_state.messages):
         role = msg["role"]
         content = msg["content"]
         css_role = "figured" if role == "assistant" else "user"
@@ -614,6 +652,10 @@ elif st.session_state.screen == "chat":
             <div class="bubble {css_role}">{content}</div>
         </div>
         """, unsafe_allow_html=True)
+
+        is_last_message = idx == len(st.session_state.messages) - 1
+        if role == "assistant" and is_last_message and st.session_state.current_warmth is not None:
+            render_warmth_indicator(st.session_state.current_warmth)
 
     if st.session_state.show_reaction:
         st.markdown(f'<div class="micro-reaction">{st.session_state.show_reaction}</div>', unsafe_allow_html=True)
@@ -716,15 +758,19 @@ elif st.session_state.screen == "chat":
                 messages=api_messages,
             )
             reply = response.content[0].text
+            reply, warmth = extract_warmth(reply)
         except anthropic.RateLimitError:
             reply = "Hit a rate limit. Give me a second and try again."
+            warmth = None
         except anthropic.APIError as e:
             reply = f"Something went wrong: {e}"
+            warmth = None
 
         typing_slot.empty()
         user_slot.empty()
         st.session_state.is_thinking = False
         st.session_state.messages.append({"role": "assistant", "content": reply})
+        st.session_state.current_warmth = warmth
 
         if breakthrough:
             st.session_state.show_confetti = True
