@@ -33,6 +33,7 @@ PROVIDER        = os.getenv("JM_PROVIDER", "anthropic").lower()
 MODEL           = os.getenv("JM_MODEL", "claude-sonnet-4-6")
 API_KEY         = os.getenv("JM_API_KEY", "")
 API_BASE_URL    = os.getenv("JM_API_BASE_URL", "")
+WEB_SEARCH_TOOL = os.getenv("JM_WEB_SEARCH_TOOL", "web_search_20250305")
 
 # ── Matcher config ─────────────────────────────────────────────────────────
 MIN_MATCH_PCT   = int(os.getenv("JM_MIN_MATCH_PCT", "60"))
@@ -106,7 +107,7 @@ def call_llm_with_search(client, client_type: str, prompt: str) -> str:
     message = client.messages.create(
         model=MODEL,
         max_tokens=4096,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        tools=[{"type": WEB_SEARCH_TOOL, "name": "web_search"}],
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -122,7 +123,7 @@ def call_llm_with_search(client, client_type: str, prompt: str) -> str:
             follow_up = client.messages.create(
                 model=MODEL,
                 max_tokens=4096,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                tools=[{"type": WEB_SEARCH_TOOL, "name": "web_search"}],
                 messages=conversation,
             )
             if follow_up.stop_reason != "tool_use":
