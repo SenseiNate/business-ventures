@@ -1,0 +1,19 @@
+# Credentials — never commit
+.env
+
+# Your personal resume and distilled profile
+# Remove these lines if you want to version-control your own profile
+resume.txt
+resume.pdf
+resume.docx
+profile.json
+
+# Generated reports
+reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

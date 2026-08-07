@@ -1,2 +1,10 @@
-anthropic
+# Required
 python-dotenv
+
+# Install the package(s) for your chosen provider:
+
+# Anthropic (recommended — enables live web search for job sourcing)
+anthropic
+
+# OpenAI / OpenRouter / Ollama / any OpenAI-compatible provider
+# openai

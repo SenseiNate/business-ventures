@@ -1,16 +1,20 @@
 """
-Job Matcher
------------
-Forked from Web Scraper Agent. Searches job boards and company career pages,
-scores each listing against a distilled candidate profile using LLM
-comparison (not keyword matching), filters to 60%+ matches, and writes a
-ranked report.
+job_matcher.py
+--------------
+Searches job boards for open roles and scores each listing against your
+distilled profile using LLM comparison — not keyword matching. Filters to
+your configured match threshold, estimates pay where it isn't disclosed,
+and writes a ranked markdown report.
 
-Requires profile.json (run distill_profile.py first) and ANTHROPIC_API_KEY
-in .env.
+Run distill_profile.py first to generate profile.json.
 
-Sourcing is web_search only. No ATS scraping, no guaranteed real-time
-listing verification. Best effort on freshness — the report says so.
+Supports any OpenAI-compatible API provider. Note: built-in web search
+(used for job sourcing and pay estimation) requires the Anthropic provider
+with a model that supports the web_search tool. With other providers the
+tool falls back to prompt-only mode, which relies on the model's training
+data rather than live search — results will be less fresh.
+
+See README.md for full setup and configuration details.
 """
 
 import json
@@ -20,35 +24,117 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL = "claude-sonnet-4-6"
-REPORTS_DIR = Path(__file__).parent / "reports"
+# ── Provider config ────────────────────────────────────────────────────────
+PROVIDER        = os.getenv("JM_PROVIDER", "anthropic").lower()
+MODEL           = os.getenv("JM_MODEL", "claude-sonnet-4-6")
+API_KEY         = os.getenv("JM_API_KEY", "")
+API_BASE_URL    = os.getenv("JM_API_BASE_URL", "")
+
+# ── Matcher config ─────────────────────────────────────────────────────────
+MIN_MATCH_PCT   = int(os.getenv("JM_MIN_MATCH_PCT", "60"))
+MAX_SEARCHES    = int(os.getenv("JM_MAX_SEARCHES", "8"))
+
+# ── File paths ─────────────────────────────────────────────────────────────
+REPORTS_DIR  = Path(__file__).parent / "reports"
 PROFILE_PATH = Path(__file__).parent / "profile.json"
-MIN_MATCH_PCT = 60  # only listings scoring >= this make the final report
-MAX_SEARCHES = 8  # number of distinct web_search queries per run
 
 
-def get_client() -> anthropic.Anthropic:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+# ── Client factory ─────────────────────────────────────────────────────────
+
+def get_client():
+    if not API_KEY:
         raise SystemExit(
-            "ANTHROPIC_API_KEY not found. Add it to your .env file and try again."
+            "JM_API_KEY not set. Add it to your .env file. See README.md."
         )
-    return anthropic.Anthropic(api_key=api_key)
+
+    if PROVIDER == "anthropic":
+        try:
+            import anthropic
+        except ImportError:
+            raise SystemExit("anthropic package not installed. Run: pip install anthropic")
+        return anthropic.Anthropic(api_key=API_KEY), "anthropic"
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise SystemExit("openai package not installed. Run: pip install openai")
+
+    kwargs = {"api_key": API_KEY}
+    if API_BASE_URL:
+        kwargs["base_url"] = API_BASE_URL
+    elif PROVIDER == "openrouter":
+        kwargs["base_url"] = "https://openrouter.ai/api/v1"
+    elif PROVIDER == "ollama":
+        kwargs["base_url"] = "http://localhost:11434/v1"
+
+    return OpenAI(**kwargs), "openai"
 
 
-def load_profile() -> dict:
-    if not PROFILE_PATH.exists():
-        raise SystemExit(
-            f"{PROFILE_PATH.name} not found. Run distill_profile.py first "
-            "to build it from your master data bank."
+# ── LLM call helpers ───────────────────────────────────────────────────────
+
+def call_llm(client, client_type: str, prompt: str) -> str:
+    """Plain text completion, no tool use."""
+    if client_type == "anthropic":
+        import anthropic as _anthropic
+        message = client.messages.create(
+            model=MODEL,
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+        return message.content[0].text
 
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content
+
+
+def call_llm_with_search(client, client_type: str, prompt: str) -> str:
+    """Text completion with Anthropic web_search tool loop.
+    Falls back to plain call for non-Anthropic providers with a notice."""
+    if client_type != "anthropic":
+        return call_llm(client, client_type, prompt)
+
+    import anthropic as _anthropic
+
+    message = client.messages.create(
+        model=MODEL,
+        max_tokens=4096,
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text_blocks = [b.text for b in message.content if b.type == "text"]
+    raw = "\n".join(text_blocks)
+
+    if message.stop_reason == "tool_use":
+        conversation = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": message.content},
+        ]
+        for _ in range(3):
+            follow_up = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=conversation,
+            )
+            if follow_up.stop_reason != "tool_use":
+                text_blocks = [b.text for b in follow_up.content if b.type == "text"]
+                raw = "\n".join(text_blocks)
+                break
+            conversation.append({"role": "assistant", "content": follow_up.content})
+
+    return raw
+
+
+# ── Utilities ──────────────────────────────────────────────────────────────
 
 def strip_fences(raw: str) -> str:
     raw = raw.strip()
@@ -57,32 +143,32 @@ def strip_fences(raw: str) -> str:
     return raw.strip()
 
 
-def slugify(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\s-]", "", text)
-    text = re.sub(r"\s+", "-", text)
-    text = re.sub(r"-+", "-", text)
-    return text[:60].strip("-") or "search"
+def load_profile() -> dict:
+    if not PROFILE_PATH.exists():
+        raise SystemExit(
+            "profile.json not found. Run distill_profile.py first to build it "
+            "from your resume. See README.md."
+        )
+    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Inputs
-# ──────────────────────────────────────────────────────────────────────────
+# ── Step 1: collect search inputs ─────────────────────────────────────────
 
 def collect_search_inputs() -> dict:
     print("\nJob Matcher\n")
 
-    pay_min = input("Minimum target pay (e.g. 110000, or blank to skip) > ").strip()
-    location_mode = input(
-        "Location preference [onsite/hybrid/remote/any] > "
-    ).strip().lower() or "any"
+    pay_min = input(
+        "Minimum target base pay (e.g. 80000), or blank to skip > "
+    ).strip()
+    location_mode = (
+        input("Location preference [onsite/hybrid/remote/any] > ").strip().lower()
+        or "any"
+    )
     location_area = ""
     if location_mode in ("onsite", "hybrid"):
-        location_area = input(
-            "City/region for onsite or hybrid roles > "
-        ).strip()
+        location_area = input("City or region for onsite/hybrid roles > ").strip()
     extra_focus = input(
-        "Any specific titles, industries, or focus to prioritize? "
+        "Specific titles, industries, or keywords to prioritize? "
         "(optional, blank to use full profile) > "
     ).strip()
 
@@ -94,12 +180,10 @@ def collect_search_inputs() -> dict:
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Step 1: build search queries from profile + inputs, then search
-# ──────────────────────────────────────────────────────────────────────────
+# ── Step 2: build queries and gather listings ──────────────────────────────
 
 def build_search_queries(profile: dict, inputs: dict) -> list[str]:
-    titles = profile.get("target_titles", [])
+    titles = list(profile.get("target_titles", []))
     if inputs["extra_focus"]:
         titles = [inputs["extra_focus"]] + titles
 
@@ -109,76 +193,50 @@ def build_search_queries(profile: dict, inputs: dict) -> list[str]:
     elif inputs["location_mode"] in ("onsite", "hybrid") and inputs["location_area"]:
         location_clause = inputs["location_area"]
 
-    queries = []
-    boards = ["site:linkedin.com/jobs", "site:indeed.com", "site:greenhouse.io", "site:lever.co"]
+    year = datetime.now().year
+    boards = [
+        "site:linkedin.com/jobs",
+        "site:indeed.com",
+        "site:greenhouse.io",
+        "site:lever.co",
+    ]
 
-    # Pair top titles with job boards, round robin, capped at MAX_SEARCHES
+    queries = []
     i = 0
     while len(queries) < MAX_SEARCHES and titles:
         title = titles[i % len(titles)]
         board = boards[i % len(boards)]
-        q = f"{board} {title} {location_clause} job opening 2026".strip()
+        q = f"{board} {title} {location_clause} job opening {year}".strip()
         if q not in queries:
             queries.append(q)
         i += 1
-        if i > MAX_SEARCHES * 3:  # safety valve against infinite loop on tiny title lists
+        if i > MAX_SEARCHES * 3:
             break
 
     return queries[:MAX_SEARCHES]
 
 
-def gather_listings(client: anthropic.Anthropic, queries: list[str]) -> list[dict]:
+def gather_listings(client, client_type: str, queries: list[str]) -> list[dict]:
     all_listings = []
 
     for q in queries:
         prompt = (
             "Search the web for this query:\n\n"
             f'"{q}"\n\n'
-            "After searching, respond with ONLY a JSON array of job listings "
-            "found. Each item must have these exact keys:\n"
-            '"company", "title", "url", "location", '
-            '"base_pay" (string, the BASE salary figure or range only, '
-            'exactly as stated in the listing — do NOT include bonus, '
-            'equity, commission, or signing bonus amounts here, just the '
-            'base. If no base salary figure is stated, use "" empty string), '
-            '"extra_comp" (string, any bonus/equity/commission/relocation '
-            'package details mentioned, in your own words, or "" empty '
-            'string if none mentioned), '
-            '"snippet" (1-3 sentences on responsibilities/requirements from '
-            "the listing).\n\n"
-            "Only include items that are actual job postings, not articles "
-            "about jobs or career advice pages. If you find no real job "
-            "postings, respond with an empty JSON array. Respond with ONLY "
-            "the JSON array, no other text."
+            "After searching, respond with ONLY a JSON array of job listings. "
+            "Each item must have these exact keys:\n"
+            '"company", "title", "url", "location",\n'
+            '"base_pay" (string — base salary figure or range ONLY, exactly '
+            "as stated. Do NOT include bonus, equity, or signing bonus here. "
+            'Empty string if not stated),\n'
+            '"extra_comp" (string — any bonus, equity, commission, or '
+            "relocation details mentioned, or empty string),\n"
+            '"snippet" (1-3 sentences on role responsibilities and requirements).\n\n'
+            "Include only actual job postings, not articles or advice pages. "
+            "Empty array if none found. Respond with ONLY the JSON array."
         )
 
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        text_blocks = [b.text for b in message.content if b.type == "text"]
-        raw = strip_fences("\n".join(text_blocks))
-
-        if message.stop_reason == "tool_use":
-            conversation = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": message.content},
-            ]
-            for _ in range(3):
-                follow_up = client.messages.create(
-                    model=MODEL,
-                    max_tokens=4096,
-                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                    messages=conversation,
-                )
-                if follow_up.stop_reason != "tool_use":
-                    text_blocks = [b.text for b in follow_up.content if b.type == "text"]
-                    raw = strip_fences("\n".join(text_blocks))
-                    break
-                conversation.append({"role": "assistant", "content": follow_up.content})
+        raw = strip_fences(call_llm_with_search(client, client_type, prompt))
 
         try:
             items = json.loads(raw)
@@ -192,42 +250,40 @@ def gather_listings(client: anthropic.Anthropic, queries: list[str]) -> list[dic
             if not isinstance(item, dict):
                 continue
             listing = {
-                "company": str(item.get("company", "")).strip(),
-                "title": str(item.get("title", "")).strip(),
-                "url": str(item.get("url", "")).strip(),
-                "location": str(item.get("location", "")).strip(),
-                "base_pay": str(item.get("base_pay", "")).strip(),
+                "company":    str(item.get("company", "")).strip(),
+                "title":      str(item.get("title", "")).strip(),
+                "url":        str(item.get("url", "")).strip(),
+                "location":   str(item.get("location", "")).strip(),
+                "base_pay":   str(item.get("base_pay", "")).strip(),
                 "extra_comp": str(item.get("extra_comp", "")).strip(),
-                "snippet": str(item.get("snippet", "")).strip(),
+                "snippet":    str(item.get("snippet", "")).strip(),
             }
             if listing["company"] and listing["title"]:
                 all_listings.append(listing)
 
-    return dedupe_listings(all_listings)
+    return _dedupe(all_listings)
 
 
-def dedupe_listings(listings: list[dict]) -> list[dict]:
-    """Dedupe by (company, title, url) since multiple board/title queries
-    commonly surface the same posting more than once."""
-    seen = set()
-    deduped = []
-    for listing in listings:
-        key = (listing["company"].lower(), listing["title"].lower(), listing["url"])
+def _dedupe(listings: list[dict]) -> list[dict]:
+    """Dedupe by (company, title, url). Multiple queries commonly surface
+    the same posting — same company+title at a different URL is kept since
+    it may be a distinct opening."""
+    seen, out = set(), []
+    for l in listings:
+        key = (l["company"].lower(), l["title"].lower(), l["url"])
         if key not in seen:
             seen.add(key)
-            deduped.append(listing)
-    return deduped
+            out.append(l)
+    return out
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Step 2: score each listing against the profile
-# ──────────────────────────────────────────────────────────────────────────
+# ── Step 3: score listings against profile ─────────────────────────────────
 
-def format_profile_for_prompt(profile: dict) -> str:
+def _format_profile(profile: dict) -> str:
     return json.dumps(profile, indent=2)
 
 
-def format_listings_for_prompt(listings: list[dict]) -> str:
+def _format_listings(listings: list[dict]) -> str:
     blocks = []
     for i, l in enumerate(listings, start=1):
         blocks.append(
@@ -235,66 +291,44 @@ def format_listings_for_prompt(listings: list[dict]) -> str:
             f"Company: {l['company']}\n"
             f"Title: {l['title']}\n"
             f"Location: {l['location']}\n"
-            f"Base pay (as stated, empty if not disclosed): {l['base_pay']}\n"
-            f"Extra comp mentioned (bonus/equity/relo, empty if none): {l['extra_comp']}\n"
+            f"Base pay (empty if not disclosed): {l['base_pay']}\n"
+            f"Extra comp (bonus/equity/relo, empty if none): {l['extra_comp']}\n"
             f"URL: {l['url']}\n"
             f"Details: {l['snippet']}"
         )
     return "\n\n---\n\n".join(blocks)
 
 
-def score_listings(client: anthropic.Anthropic, profile: dict, listings: list[dict]) -> list[dict]:
-    profile_text = format_profile_for_prompt(profile)
-    listings_text = format_listings_for_prompt(listings)
-
+def score_listings(client, client_type: str, profile: dict, listings: list[dict]) -> list[dict]:
     prompt = (
         "You are scoring job listings against a candidate profile for fit. "
-        "Compare based on actual substance, not literal keyword overlap. "
-        "Titles and required skills are phrased inconsistently across job "
-        "postings and companies, so judge whether the candidate's real "
-        "experience and competencies would make them a strong, qualified "
-        "applicant for each role, even if exact wording differs.\n\n"
-        f"CANDIDATE PROFILE:\n{profile_text}\n\n"
-        f"JOB LISTINGS:\n\n{listings_text}\n\n"
-        "For each listing, respond with ONLY a JSON array. Each item must "
-        "have these exact keys:\n"
-        '"company", "title", "location", "url", '
-        '"base_pay" (string, copy the base pay value through exactly as '
-        'given for this listing, or "" empty string if it was empty), '
-        '"extra_comp" (string, copy the extra comp value through exactly '
-        'as given, or "" empty string if it was empty), '
-        '"match_pct" (integer 0-100, your honest assessment of fit), '
-        '"reasoning" (1-2 sentences on why this score, citing specific '
-        "overlap or gaps between the profile and the listing).\n\n"
-        "Do not invent or estimate pay figures here, just pass through "
-        "exactly what was given for base_pay and extra_comp. A later step "
-        "handles pay estimation separately.\n\n"
-        "Score honestly. Do not inflate scores. A generic PM title at a "
-        "company in an unrelated field with no real skill overlap should "
-        "score low. A role that closely matches the candidate's actual "
-        "competencies and seniority should score high even if the title "
-        "wording differs.\n\n"
-        "On education requirements: treat these as a pass/fail credential "
-        "check, not a fit factor. If a listing requires 'a bachelor's "
-        "degree' or 'a bachelor's degree in a related field,' the "
-        "candidate's degree satisfies that requirement regardless of "
-        "subject matter, and this should not reduce the match score or be "
-        "cited as a gap in the reasoning. Only treat a specific degree "
-        "field as a real gap if the listing is unambiguous that one "
-        "exact discipline is mandatory and non-negotiable (e.g. 'JD "
-        "required,' 'must hold a degree in mechanical engineering, no "
-        "exceptions'), which is rare. Years of experience and demonstrated "
-        "competencies matter far more than degree subject matter and "
-        "should drive the score. Respond with ONLY the JSON array, no "
-        "other text."
+        "Judge based on actual substance — not literal keyword overlap. "
+        "Titles and skills are phrased inconsistently across companies; "
+        "assess whether the candidate's real experience and competencies "
+        "would make them a strong, qualified applicant for each role.\n\n"
+        f"CANDIDATE PROFILE:\n{_format_profile(profile)}\n\n"
+        f"JOB LISTINGS:\n\n{_format_listings(listings)}\n\n"
+        "Return ONLY a JSON array. Each item must have:\n"
+        '"company", "title", "location", "url",\n'
+        '"base_pay" (copy through exactly as given, or empty string),\n'
+        '"extra_comp" (copy through exactly as given, or empty string),\n'
+        '"match_pct" (integer 0-100, your honest fit assessment),\n'
+        '"reasoning" (1-2 sentences on why, citing specific overlaps or gaps).\n\n'
+        "Do not invent or estimate pay figures here — copy them through unchanged.\n\n"
+        "Score honestly. Do not inflate. A generic title with no real skill overlap "
+        "should score low. Strong competency match should score high even if the "
+        "title wording differs.\n\n"
+        "On education: treat degree requirements as a pass/fail checkbox. "
+        "Do not penalise for degree subject matter unless a specific discipline "
+        "is explicitly non-negotiable in the listing (e.g. 'JD required'). "
+        "Years of experience and demonstrated competencies drive the score.\n\n"
+        "On seniority: if a listing explicitly targets junior/entry level "
+        "(e.g. '1-2 years required', 'new grad') and the candidate is "
+        "significantly more senior, score it down accordingly.\n\n"
+        "Respond with ONLY the JSON array, no other text."
     )
 
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = strip_fences(message.content[0].text)
+    raw = strip_fences(call_llm(client, client_type, prompt))
 
     try:
         scored = json.loads(raw)
@@ -312,24 +346,20 @@ def score_listings(client: anthropic.Anthropic, profile: dict, listings: list[di
             pct = int(item.get("match_pct", 0))
         except (ValueError, TypeError):
             pct = 0
-        results.append(
-            {
-                "company": str(item.get("company", "")).strip(),
-                "title": str(item.get("title", "")).strip(),
-                "location": str(item.get("location", "")).strip(),
-                "base_pay": str(item.get("base_pay", "")).strip(),
-                "extra_comp": str(item.get("extra_comp", "")).strip(),
-                "url": str(item.get("url", "")).strip(),
-                "match_pct": max(0, min(100, pct)),
-                "reasoning": str(item.get("reasoning", "")).strip(),
-            }
-        )
+        results.append({
+            "company":    str(item.get("company", "")).strip(),
+            "title":      str(item.get("title", "")).strip(),
+            "location":   str(item.get("location", "")).strip(),
+            "url":        str(item.get("url", "")).strip(),
+            "base_pay":   str(item.get("base_pay", "")).strip(),
+            "extra_comp": str(item.get("extra_comp", "")).strip(),
+            "match_pct":  max(0, min(100, pct)),
+            "reasoning":  str(item.get("reasoning", "")).strip(),
+        })
     return results
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Step 3: filter, rank, report
-# ──────────────────────────────────────────────────────────────────────────
+# ── Step 4: filter and rank ────────────────────────────────────────────────
 
 def filter_and_rank(scored: list[dict]) -> list[dict]:
     kept = [s for s in scored if s["match_pct"] >= MIN_MATCH_PCT]
@@ -337,85 +367,53 @@ def filter_and_rank(scored: list[dict]) -> list[dict]:
     return kept
 
 
-def enrich_missing_pay(client: anthropic.Anthropic, results: list[dict]) -> list[dict]:
-    """For kept results with no disclosed base pay, do a single batched
-    lookup call estimating typical base salary range. Only runs on
-    listings that already cleared the match threshold, since estimating
-    pay for everything found would be wasteful.
-    """
+# ── Step 5: pay enrichment for listings with no disclosed base ─────────────
+
+def enrich_missing_pay(client, client_type: str, results: list[dict]) -> list[dict]:
+    """Single batched lookup for kept listings with no disclosed base pay.
+    Uses web search when available (Anthropic), falls back to model knowledge
+    for other providers. Always labeled estimated vs. stated in the report."""
     needs_estimate = [r for r in results if not r["base_pay"]]
-    if not needs_estimate:
-        for r in results:
-            r["pay_is_estimate"] = False
-        return results
-
-    roles_text = "\n".join(
-        f"{i+1}. {r['title']} at {r['company']}, location: {r['location'] or 'not specified'}"
-        for i, r in enumerate(needs_estimate)
-    )
-
-    prompt = (
-        "For each numbered role below, research and estimate a realistic "
-        "typical BASE salary range (not total comp) for that title, at "
-        "that company if you have specific knowledge of it, in that "
-        "location, at a senior level. Use general market knowledge for "
-        "similar roles if you don't have company-specific data.\n\n"
-        f"{roles_text}\n\n"
-        "Respond with ONLY a JSON array with exactly one object per "
-        "numbered role above, in the same order, same count, no skipping "
-        "and no merging roles together even if two look similar. Each "
-        'object needs keys "role_number" (integer, matching the number '
-        'above), "estimated_range" (string, e.g. "$140,000 - $175,000"), '
-        'and "basis" (string, 3-8 words on what the estimate is based on, '
-        'e.g. "similar roles at comparable defense contractors" or '
-        '"company-specific data found"). If you genuinely cannot form a '
-        "reasonable estimate for a role, still include its object with "
-        "empty strings for estimated_range and basis. Respond with ONLY "
-        "the JSON array, no other text."
-    )
-
-    estimates = []
-    try:
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        text_blocks = [b.text for b in message.content if b.type == "text"]
-        raw = strip_fences("\n".join(text_blocks))
-
-        if message.stop_reason == "tool_use":
-            conversation = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": message.content},
-            ]
-            for _ in range(3):
-                follow_up = client.messages.create(
-                    model=MODEL,
-                    max_tokens=4096,
-                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                    messages=conversation,
-                )
-                if follow_up.stop_reason != "tool_use":
-                    text_blocks = [b.text for b in follow_up.content if b.type == "text"]
-                    raw = strip_fences("\n".join(text_blocks))
-                    break
-                conversation.append({"role": "assistant", "content": follow_up.content})
-
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            estimates = parsed
-    except Exception as e:
-        print(f"  Pay estimation call failed, leaving pay as not found: {e}")
-        estimates = []
 
     for r in results:
         r["pay_is_estimate"] = False
 
-    # Match by role_number rather than position, since a batch of 9+ items
-    # is prone to the model skipping, merging, or reordering entries.
+    if not needs_estimate:
+        return results
+
+    roles_text = "\n".join(
+        f"{i}. {r['title']} at {r['company']}, "
+        f"location: {r['location'] or 'not specified'}"
+        for i, r in enumerate(needs_estimate, start=1)
+    )
+
+    prompt = (
+        "For each numbered role below, research and estimate a realistic "
+        "typical BASE salary range (not total comp) for that title at that "
+        "company in that location, at the appropriate seniority level. Use "
+        "company-specific data where you have it, otherwise use market data "
+        "for similar roles.\n\n"
+        f"{roles_text}\n\n"
+        "Respond with ONLY a JSON array with exactly one object per role, "
+        "in the same order, no skipping. Each object needs:\n"
+        '"role_number" (integer matching the number above),\n'
+        '"estimated_range" (e.g. "$90,000 - $120,000"),\n'
+        '"basis" (3-8 words on what the estimate is based on).\n'
+        "If you cannot form a reasonable estimate for a role, still include "
+        "its object with empty strings for estimated_range and basis.\n"
+        "Respond with ONLY the JSON array, no other text."
+    )
+
+    estimates = []
+    try:
+        raw = strip_fences(call_llm_with_search(client, client_type, prompt))
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            estimates = parsed
+    except Exception as e:
+        print(f"  Pay estimation call failed: {e}")
+        return results
+
     estimates_by_number = {}
     for est in estimates:
         if not isinstance(est, dict):
@@ -426,10 +424,10 @@ def enrich_missing_pay(client: anthropic.Anthropic, results: list[dict]) -> list
             continue
         estimates_by_number[num] = est
 
-    matched_count = 0
+    matched = 0
     for i, r in enumerate(needs_estimate, start=1):
         est = estimates_by_number.get(i)
-        if est is None:
+        if not est:
             continue
         est_range = str(est.get("estimated_range", "")).strip()
         basis = str(est.get("basis", "")).strip()
@@ -437,80 +435,82 @@ def enrich_missing_pay(client: anthropic.Anthropic, results: list[dict]) -> list
             r["base_pay"] = est_range
             r["pay_is_estimate"] = True
             r["pay_basis"] = basis
-            matched_count += 1
+            matched += 1
 
-    if estimates and matched_count == 0:
-        print("  Pay estimates came back but didn't match expected format, leaving pay as not found.")
+    if estimates and matched == 0:
+        print("  Pay estimates returned but could not be matched — leaving pay as not found.")
 
     return results
 
 
-def format_pay_for_display(r: dict) -> str:
+# ── Step 6: report ─────────────────────────────────────────────────────────
+
+def _pay_display(r: dict) -> str:
     if not r["base_pay"]:
         return "Not found"
     if r.get("pay_is_estimate"):
         basis = r.get("pay_basis", "")
-        suffix = f" (est., {basis})" if basis else " (estimated)"
+        suffix = f" (est. — {basis})" if basis else " (estimated)"
         return f"{r['base_pay']}{suffix}"
     return r["base_pay"]
 
 
 def build_report(inputs: dict, total_found: int, results: list[dict], now: datetime) -> str:
     lines = []
-    lines.append(f"# Job Match Report")
+    lines.append("# Job Match Report")
     lines.append("")
     lines.append(f"**Date:** {now:%B %d, %Y %I:%M %p}")
+
+    loc = inputs["location_mode"]
+    if inputs["location_area"]:
+        loc += f" ({inputs['location_area']})"
+    pay = f"${int(inputs['pay_min']):,}" if inputs["pay_min"].isdigit() else inputs["pay_min"] or "none"
+    lines.append(f"**Filters:** min pay {pay} | location {loc}")
+    lines.append("")
     lines.append(
-        f"**Filters:** pay min {inputs['pay_min'] or 'none'} | "
-        f"location {inputs['location_mode']}"
-        + (f" ({inputs['location_area']})" if inputs["location_area"] else "")
+        "> Sourced via web search only. No direct ATS scraping; listing "
+        "freshness is best-effort — confirm a role is still open before "
+        "applying. Pay marked **(estimated)** is a market estimate, not a "
+        "figure stated in the listing."
     )
     lines.append("")
     lines.append(
-        "Sourced via web search only. No direct ATS scraping and no "
-        "guaranteed real-time open/closed verification per company. "
-        "Best effort on freshness, confirm a listing is still live before "
-        "applying. Pay marked \"(estimated)\" is a market estimate, not a "
-        "figure stated in the listing, confirm before relying on it."
-    )
-    lines.append("")
-    lines.append(
-        f"**Found {total_found} listings. {len(results)} scored "
-        f"{MIN_MATCH_PCT}% or higher.**"
+        f"**{total_found} listings reviewed. "
+        f"{len(results)} scored {MIN_MATCH_PCT}% or higher.**"
     )
     lines.append("")
 
     if not results:
         lines.append(
-            "No listings cleared the match threshold this run. Try "
-            "broadening location, lowering pay floor, or widening "
-            "target titles."
+            "No listings cleared the match threshold. Try broadening your "
+            "location, lowering the pay floor, or adding more target titles "
+            "to profile.json."
         )
         return "\n".join(lines)
 
-    lines.append("| Rank | Match | Company | Title | Pay | Location | Listing Link | Extra Details |")
-    lines.append("|------|-------|---------|-------|-----|----------|--------------|----------------|")
+    # Summary table
+    lines.append("| # | Match | Company | Title | Pay | Location | Apply | Extra Comp |")
+    lines.append("|---|-------|---------|-------|-----|----------|-------|------------|")
     for i, r in enumerate(results, start=1):
-        pay_display = format_pay_for_display(r)
-        extra = r["extra_comp"] or "—"
         lines.append(
             f"| {i} | {r['match_pct']}% | {r['company']} | {r['title']} | "
-            f"{pay_display} | {r['location'] or '—'} | [Apply]({r['url']}) | {extra} |"
+            f"{_pay_display(r)} | {r['location'] or '—'} | "
+            f"[Link]({r['url']}) | {r['extra_comp'] or '—'} |"
         )
 
     lines.append("")
     lines.append("---")
     lines.append("")
 
+    # Detail sections
     for i, r in enumerate(results, start=1):
-        pay_display = format_pay_for_display(r)
         lines.append(f"## {i}. {r['title']} — {r['company']}")
-        lines.append(f"**Match:** {r['match_pct']}%")
-        lines.append(f"**Pay:** {pay_display}")
+        lines.append(f"**Match:** {r['match_pct']}%  ")
+        lines.append(f"**Pay:** {_pay_display(r)}  ")
         if r["extra_comp"]:
-            lines.append(f"**Extra comp:** {r['extra_comp']}")
-        lines.append(f"**Location:** {r['location'] or 'not specified'}")
-        lines.append(f"**Apply:** {r['url']}")
+            lines.append(f"**Extra comp:** {r['extra_comp']}  ")
+        lines.append(f"**Location:** {r['location'] or 'not specified'}  ")
+        lines.append(f"**Apply:** {r['url']}  ")
         lines.append(f"**Why:** {r['reasoning']}")
         lines.append("")
 
@@ -519,8 +519,7 @@ def build_report(inputs: dict, total_found: int, results: list[dict], now: datet
 
 def save_report(report: str, now: datetime) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{now:%Y-%m-%d_%H%M}_job-matches.md"
-    filepath = REPORTS_DIR / filename
+    filepath = REPORTS_DIR / f"{now:%Y-%m-%d_%H%M}_job-matches.md"
     filepath.write_text(report, encoding="utf-8")
     return filepath
 
@@ -537,34 +536,40 @@ def print_report(report: str) -> None:
     print("=" * width)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────
 
 def run() -> None:
     profile = load_profile()
-    client = get_client()
+    client, client_type = get_client()
+
+    if client_type != "anthropic":
+        print(
+            f"\n[Note] Provider '{PROVIDER}' does not support live web search. "
+            "Job sourcing will rely on the model's training data. Results may "
+            "be less fresh than with the Anthropic provider."
+        )
+
     inputs = collect_search_inputs()
 
     queries = build_search_queries(profile, inputs)
-    print(f"\nRunning {len(queries)} job board searches...")
-    listings = gather_listings(client, queries)
+    print(f"\nRunning {len(queries)} searches...")
+    listings = gather_listings(client, client_type, queries)
     print(f"  Found {len(listings)} unique listings.")
 
     if not listings:
-        print("\nNo listings found. Try different search terms or location.")
+        print("\nNo listings found. Try broadening your search inputs.")
         return
 
     print(f"\nScoring {len(listings)} listings against your profile...")
-    scored = score_listings(client, profile, listings)
+    scored = score_listings(client, client_type, profile, listings)
 
     results = filter_and_rank(scored)
     print(f"  {len(results)} cleared the {MIN_MATCH_PCT}% threshold.")
 
-    missing_pay_count = sum(1 for r in results if not r["base_pay"])
-    if missing_pay_count:
-        print(f"\nEstimating base pay for {missing_pay_count} listings with no disclosed salary...")
-        results = enrich_missing_pay(client, results)
+    missing_pay = sum(1 for r in results if not r["base_pay"])
+    if missing_pay:
+        print(f"\nEstimating pay for {missing_pay} listings with no disclosed salary...")
+        results = enrich_missing_pay(client, client_type, results)
 
     now = datetime.now()
     report = build_report(inputs, len(listings), results, now)
@@ -574,9 +579,5 @@ def run() -> None:
     print(f"\nSaved to {filepath}")
 
 
-def main() -> None:
-    run()
-
-
 if __name__ == "__main__":
-    main()
+    run()
